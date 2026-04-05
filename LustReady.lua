@@ -43,11 +43,12 @@ local HEROISM_SPELLS = {
 --- State Queries
 -------------------------------------------------------------------------------
 
-local function IsInInstance()
+local function IsInGroupInstance()
     local _, instanceType = IsInInstance()
 
     return instanceType == "party"
         or instanceType == "raid"
+        or instanceType == "scenario"
         or instanceType == "arena"
         or instanceType == "pvp"
 end
@@ -62,24 +63,35 @@ local function FindPlayerHeroismSpell()
     return nil
 end
 
-local function HasSatedDebuff()
+local function GetSatedRemaining()
     for spellID in pairs(SATED_DEBUFFS) do
-        if C_UnitAuras.GetPlayerAuraBySpellID(spellID) then
-            return true
+        local aura = C_UnitAuras.GetPlayerAuraBySpellID(spellID)
+        if aura then
+            local remaining = aura.expirationTime - GetTime()
+
+            return math.max(remaining, 0)
         end
     end
 
-    return false
+    return 0
 end
 
-local function IsHeroismOffCooldown(spellID)
+local COUNTDOWN_THRESHOLD = 30
+
+local function GetHeroismCooldownRemaining(spellID)
     local info = C_Spell.GetSpellCooldown(spellID)
     if not info then
-        return false
+        return nil
     end
 
-    -- duration <= 1.5 filters out the GCD
-    return info.duration <= 1.5
+    -- duration <= 1.5 is just the GCD
+    if info.duration <= 1.5 then
+        return 0
+    end
+
+    local remaining = (info.startTime + info.duration) - GetTime()
+
+    return math.max(remaining, 0)
 end
 
 -------------------------------------------------------------------------------
@@ -135,22 +147,44 @@ function LR:ShouldShow()
         return false
     end
 
-    if HasSatedDebuff() then
+    local cdRemaining = GetHeroismCooldownRemaining(LR.heroismSpellID)
+    if not cdRemaining then
         return false
     end
 
-    if not IsHeroismOffCooldown(LR.heroismSpellID) then
+    local satedRemaining = GetSatedRemaining()
+    local remaining = math.max(cdRemaining, satedRemaining)
+
+    local isReady = remaining == 0
+    local isSoon = remaining > 0 and remaining <= COUNTDOWN_THRESHOLD
+
+    if not isReady and not isSoon then
         return false
     end
 
-    -- In an instance: always show when ready
-    if IsInInstance() then
-        return true
+    -- In an instance: always show
+    if IsInGroupInstance() then
+        return true, remaining
     end
 
-    -- Open world: only show in combat
-    return inCombat
+    -- Open world: only in combat
+    if inCombat then
+        return true, remaining
+    end
+
+    return false
 end
+
+function LR:UpdateText(remaining)
+    if remaining == 0 then
+        LR.frame.text:SetText("Lust Ready")
+    else
+        LR.frame.text:SetText("Lust in " .. math.ceil(remaining))
+    end
+end
+
+local UPDATE_INTERVAL = 0.5
+local timeSinceLastUpdate = 0
 
 function LR:UpdateVisibility()
     if testing then
@@ -166,11 +200,24 @@ function LR:UpdateVisibility()
         return
     end
 
-    if LR:ShouldShow() then
+    local shouldShow, remaining = LR:ShouldShow()
+
+    if shouldShow then
+        LR:UpdateText(remaining)
         LR.frame:Show()
+        LR.frame:SetScript("OnUpdate", LR.OnUpdate)
     else
         LR.frame:Hide()
+        LR.frame:SetScript("OnUpdate", nil)
     end
+end
+
+function LR.OnUpdate(self, elapsed)
+    timeSinceLastUpdate = timeSinceLastUpdate + elapsed
+    if timeSinceLastUpdate < UPDATE_INTERVAL then return end
+
+    timeSinceLastUpdate = 0
+    LR:UpdateVisibility()
 end
 
 -------------------------------------------------------------------------------
@@ -237,6 +284,7 @@ local function OnAddonLoaded(self, arg1)
     LR.frame:RegisterEvent("SPELL_UPDATE_COOLDOWN")
     LR.frame:RegisterEvent("SPELLS_CHANGED")
     LR.frame:RegisterEvent("PLAYER_ENTERING_WORLD")
+    LR.frame:RegisterEvent("ZONE_CHANGED_NEW_AREA")
     LR.frame:RegisterEvent("PLAYER_REGEN_DISABLED")
     LR.frame:RegisterEvent("PLAYER_REGEN_ENABLED")
 
@@ -281,6 +329,7 @@ local EVENT_HANDLERS = {
     SPELL_UPDATE_COOLDOWN  = OnSpellUpdateCooldown,
     SPELLS_CHANGED         = OnSpellsChanged,
     PLAYER_ENTERING_WORLD  = OnPlayerEnteringWorld,
+    ZONE_CHANGED_NEW_AREA  = OnPlayerEnteringWorld,
     PLAYER_REGEN_DISABLED  = OnCombatStart,
     PLAYER_REGEN_ENABLED   = OnCombatEnd,
 }
