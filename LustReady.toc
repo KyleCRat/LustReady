@@ -1,0 +1,8 @@
+## Interface: 120000, 120001
+## Title: Lust Ready
+## Author: Yvairel
+## Version: 12.0.1-1
+## SavedVariablesPerCharacter: LustReadyDB
+
+Commands.lua
+LustReady.lua
