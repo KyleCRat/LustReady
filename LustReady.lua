@@ -63,10 +63,25 @@ local function FindPlayerHeroismSpell()
     return nil
 end
 
+local function HasSatedDebuff()
+    for spellID in pairs(SATED_DEBUFFS) do
+        local aura = C_UnitAuras.GetPlayerAuraBySpellID(spellID)
+        if aura then
+            return true
+        end
+    end
+
+    return false
+end
+
 local function GetSatedRemaining()
     for spellID in pairs(SATED_DEBUFFS) do
         local aura = C_UnitAuras.GetPlayerAuraBySpellID(spellID)
         if aura then
+            if issecretvalue(aura.expirationTime) then
+                return 0
+            end
+
             local remaining = aura.expirationTime - GetTime()
 
             return math.max(remaining, 0)
@@ -78,10 +93,23 @@ end
 
 local COUNTDOWN_THRESHOLD = 30
 
+local function IsHeroismOnCooldown(spellID)
+    local info = C_Spell.GetSpellCooldown(spellID)
+    if not info then
+        return false
+    end
+
+    return info.isActive
+end
+
 local function GetHeroismCooldownRemaining(spellID)
     local info = C_Spell.GetSpellCooldown(spellID)
     if not info then
         return nil
+    end
+
+    if issecretvalue(info.duration) then
+        return 0
     end
 
     -- duration <= 1.5 is just the GCD
@@ -142,14 +170,36 @@ end
 --- Visibility
 -------------------------------------------------------------------------------
 
+local function IsHeroismReady(spellID)
+    if IsHeroismOnCooldown(spellID) then
+        return false
+    end
+
+    if HasSatedDebuff() then
+        return false
+    end
+
+    return true
+end
+
 function LR:ShouldShow()
     if not LR.heroismSpellID then
-        return false
+        return false, nil
+    end
+
+    -- In combat, cooldown fields are tainted (secret values) and cannot
+    -- be compared.  Only check ready state, skip the countdown window.
+    if inCombat then
+        if IsHeroismReady(LR.heroismSpellID) then
+            return true, 0
+        end
+
+        return false, nil
     end
 
     local cdRemaining = GetHeroismCooldownRemaining(LR.heroismSpellID)
     if not cdRemaining then
-        return false
+        return false, nil
     end
 
     local satedRemaining = GetSatedRemaining()
@@ -159,20 +209,14 @@ function LR:ShouldShow()
     local isSoon = remaining > 0 and remaining <= COUNTDOWN_THRESHOLD
 
     if not isReady and not isSoon then
-        return false
+        return false, nil
     end
 
-    -- In an instance: always show
     if IsInGroupInstance() then
         return true, remaining
     end
 
-    -- Open world: only in combat
-    if inCombat then
-        return true, remaining
-    end
-
-    return false
+    return false, nil
 end
 
 function LR:UpdateText(remaining)
@@ -247,7 +291,11 @@ LR.frame.handle:SetVertexColor(1, 1, 1, 1)
 LR.frame:EnableMouse(true)
 LR.frame:RegisterForDrag("LeftButton")
 LR.frame:SetScript("OnDragStart", LR.frame.StartMoving)
-LR.frame:SetScript("OnDragStop", LR.frame.StopMovingOrSizing)
+LR.frame:SetScript("OnDragStop", function(self)
+    self:StopMovingOrSizing()
+    local point, _, relPoint, x, y = self:GetPoint(1)
+    LustReadyDB.position = { point = point, relPoint = relPoint, x = x, y = y }
+end)
 
 -- Font
 local FONT = "Interface\\AddOns\\LustReady\\media\\fonts\\PTSansNarrow-Bold.ttf"
@@ -273,6 +321,12 @@ local function OnAddonLoaded(self, arg1)
     if not LustReadyDB then
         LR:Print("LustReadyDB not available, creating.")
         LustReadyDB = { locked = false }
+    end
+
+    local pos = LustReadyDB.position
+    if pos then
+        LR.frame:ClearAllPoints()
+        LR.frame:SetPoint(pos.point, UIParent, pos.relPoint, pos.x, pos.y)
     end
 
     LR.heroismSpellID = FindPlayerHeroismSpell()
