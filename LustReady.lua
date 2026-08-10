@@ -66,7 +66,7 @@ end
 local function HasSatedDebuff()
     for spellID in pairs(SATED_DEBUFFS) do
         local aura = C_UnitAuras.GetPlayerAuraBySpellID(spellID)
-        if aura then
+        if not issecretvalue(aura) and aura then
             return true
         end
     end
@@ -77,12 +77,13 @@ end
 local function GetSatedRemaining()
     for spellID in pairs(SATED_DEBUFFS) do
         local aura = C_UnitAuras.GetPlayerAuraBySpellID(spellID)
-        if aura then
-            if issecretvalue(aura.expirationTime) then
-                return 0
+        if not issecretvalue(aura) and aura then
+            local expirationTime = aura.expirationTime
+            if issecretvalue(expirationTime) or type(expirationTime) ~= "number" then
+                return nil
             end
 
-            local remaining = aura.expirationTime - GetTime()
+            local remaining = expirationTime - GetTime()
 
             return math.max(remaining, 0)
         end
@@ -95,29 +96,38 @@ local COUNTDOWN_THRESHOLD = 30
 
 local function IsHeroismOnCooldown(spellID)
     local info = C_Spell.GetSpellCooldown(spellID)
-    if not info then
-        return false
+    if not info or issecretvalue(info) then
+        return nil
     end
 
-    return info.isActive
+    local isActive = info.isActive
+    if issecretvalue(isActive) or type(isActive) ~= "boolean" then
+        return nil
+    end
+
+    return isActive
 end
 
 local function GetHeroismCooldownRemaining(spellID)
     local info = C_Spell.GetSpellCooldown(spellID)
-    if not info then
+    if not info or issecretvalue(info) then
         return nil
     end
 
-    if issecretvalue(info.duration) then
-        return 0
+    local startTime = info.startTime
+    local duration = info.duration
+    if issecretvalue(startTime) or issecretvalue(duration)
+        or type(startTime) ~= "number" or type(duration) ~= "number"
+    then
+        return nil
     end
 
     -- duration <= 1.5 is just the GCD
-    if info.duration <= 1.5 then
+    if duration <= 1.5 then
         return 0
     end
 
-    local remaining = (info.startTime + info.duration) - GetTime()
+    local remaining = (startTime + duration) - GetTime()
 
     return math.max(remaining, 0)
 end
@@ -171,7 +181,8 @@ end
 -------------------------------------------------------------------------------
 
 local function IsHeroismReady(spellID)
-    if IsHeroismOnCooldown(spellID) then
+    local isOnCooldown = IsHeroismOnCooldown(spellID)
+    if isOnCooldown == nil or isOnCooldown then
         return false
     end
 
@@ -203,6 +214,10 @@ function LR:ShouldShow()
     end
 
     local satedRemaining = GetSatedRemaining()
+    if satedRemaining == nil then
+        return false, nil
+    end
+
     local remaining = math.max(cdRemaining, satedRemaining)
 
     local isReady = remaining == 0
@@ -346,7 +361,7 @@ local function OnAddonLoaded(self, arg1)
 end
 
 local function OnUnitAura(self, unit)
-    if unit ~= "player" then return end
+    if issecretvalue(unit) or unit ~= "player" then return end
 
     LR:UpdateVisibility()
 end

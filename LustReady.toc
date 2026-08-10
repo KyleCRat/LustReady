@@ -1,7 +1,7 @@
-## Interface: 120001, 120005
+## Interface: 120007, 120100
 ## Title: Lust Ready
 ## Author: Yvairel
-## Version: 12.0.5-2
+## Version: 12.1.0-3
 ## SavedVariablesPerCharacter: LustReadyDB
 
 Commands.lua
