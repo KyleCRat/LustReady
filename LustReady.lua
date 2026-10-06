@@ -17,6 +17,15 @@ local testing  = false
 local verbose  = false
 local inCombat = false
 
+local petAvailable = false
+local petSpellSlot
+local ownedDrums = {}
+local pendingItemData = {}
+local refreshTimer
+
+local COUNTDOWN_THRESHOLD = 30
+local UPDATE_INTERVAL = 0.5
+
 -------------------------------------------------------------------------------
 --- Spell Data
 -------------------------------------------------------------------------------
@@ -35,8 +44,16 @@ local HEROISM_SPELLS = {
     32182,  -- Shaman: Heroism
     2825,   -- Shaman: Bloodlust
     80353,  -- Mage: Time Warp
-    264667, -- Hunter: Primal Rage
     390386, -- Evoker: Fury of the Aspects
+    466904, -- Marksmanship Hunter: Harrier's Cry
+}
+
+-- Primal Rage belongs to the active pet, not the player's Command Pet spell.
+local PRIMAL_RAGE = 264667
+
+local DRUM_ITEMS = {
+    244639, -- Void-Touched Drums (Midnight)
+    219905, -- Thunderous Drums (The War Within)
 }
 
 -------------------------------------------------------------------------------
@@ -49,13 +66,16 @@ local function IsInGroupInstance()
     return instanceType == "party"
         or instanceType == "raid"
         or instanceType == "scenario"
-        or instanceType == "arena"
         or instanceType == "pvp"
+end
+
+local function IsPetAvailable()
+    return UnitExists("pet") and not UnitIsDeadOrGhost("pet")
 end
 
 local function FindPlayerHeroismSpell()
     for _, spellID in ipairs(HEROISM_SPELLS) do
-        if IsPlayerSpell(spellID) then
+        if C_SpellBook.IsSpellKnown(spellID, Enum.SpellBookSpellBank.Player) then
             return spellID
         end
     end
@@ -63,73 +83,150 @@ local function FindPlayerHeroismSpell()
     return nil
 end
 
-local function HasSatedDebuff()
-    for spellID in pairs(SATED_DEBUFFS) do
-        local aura = C_UnitAuras.GetPlayerAuraBySpellID(spellID)
-        if not issecretvalue(aura) and aura then
-            return true
+local function FindPetHeroismSlot()
+    local spellBank = Enum.SpellBookSpellBank.Pet
+    if not petAvailable or not C_SpellBook.IsSpellKnown(PRIMAL_RAGE, spellBank) then
+        return nil
+    end
+
+    local numPetSpells = C_SpellBook.HasPetSpells() or 0
+    for slot = 1, numPetSpells do
+        local info = C_SpellBook.GetSpellBookItemInfo(slot, spellBank)
+        if info and info.spellID == PRIMAL_RAGE then
+            return slot
         end
     end
 
-    return false
+    return nil
+end
+
+function LR:RefreshSources()
+    petAvailable = IsPetAvailable()
+    LR.heroismSpellID = FindPlayerHeroismSpell()
+    petSpellSlot = nil
+    wipe(ownedDrums)
+
+    if not LR.heroismSpellID then
+        petSpellSlot = FindPetHeroismSlot()
+        if petSpellSlot then
+            LR.heroismSpellID = PRIMAL_RAGE
+        end
+    end
+
+    -- Prefer the class/pet ability, even while it is on cooldown.
+    if LR.heroismSpellID then return end
+
+    for _, itemID in ipairs(DRUM_ITEMS) do
+        -- The default count excludes all banks.
+        if C_Item.GetItemCount(itemID) > 0 then
+            ownedDrums[#ownedDrums + 1] = itemID
+            if not C_Item.IsItemDataCachedByID(itemID) and not pendingItemData[itemID] then
+                pendingItemData[itemID] = true
+                C_Item.RequestLoadItemDataByID(itemID)
+            end
+        end
+    end
 end
 
 local function GetSatedRemaining()
+    local longestRemaining = 0
     for spellID in pairs(SATED_DEBUFFS) do
         local aura = C_UnitAuras.GetPlayerAuraBySpellID(spellID)
-        if not issecretvalue(aura) and aura then
+        if issecretvalue(aura) then return nil end
+
+        if aura then
+            -- Any known lockout blocks the combat alert, without reading timing.
+            if inCombat then return nil end
+
             local expirationTime = aura.expirationTime
             if issecretvalue(expirationTime) or type(expirationTime) ~= "number" then
                 return nil
             end
 
-            local remaining = expirationTime - GetTime()
+            if expirationTime == 0 then return nil end
 
-            return math.max(remaining, 0)
+            longestRemaining = math.max(longestRemaining, expirationTime - GetTime())
         end
     end
 
-    return 0
+    return longestRemaining
 end
 
-local COUNTDOWN_THRESHOLD = 30
+local function GetHeroismCooldownRemaining()
+    local info
+    if petSpellSlot then
+        if not IsPetAvailable() then return nil end
 
-local function IsHeroismOnCooldown(spellID)
-    local info = C_Spell.GetSpellCooldown(spellID)
-    if not info or issecretvalue(info) then
-        return nil
+        -- Revalidate the slot after a pet swap before querying its cooldown.
+        local spellInfo = C_SpellBook.GetSpellBookItemInfo(petSpellSlot, Enum.SpellBookSpellBank.Pet)
+        if not spellInfo or spellInfo.spellID ~= PRIMAL_RAGE then return nil end
+
+        info = C_SpellBook.GetSpellBookItemCooldown(petSpellSlot, Enum.SpellBookSpellBank.Pet)
+    else
+        info = C_Spell.GetSpellCooldown(LR.heroismSpellID)
     end
 
-    local isActive = info.isActive
-    if issecretvalue(isActive) or type(isActive) ~= "boolean" then
-        return nil
-    end
+    if issecretvalue(info) or not info then return nil end
 
-    return isActive
-end
-
-local function GetHeroismCooldownRemaining(spellID)
-    local info = C_Spell.GetSpellCooldown(spellID)
-    if not info or issecretvalue(info) then
-        return nil
-    end
-
-    local startTime = info.startTime
-    local duration = info.duration
-    if issecretvalue(startTime) or issecretvalue(duration)
-        or type(startTime) ~= "number" or type(duration) ~= "number"
+    local isEnabled, isActive = info.isEnabled, info.isActive
+    if issecretvalue(isEnabled) or issecretvalue(isActive)
+        or isEnabled ~= true or type(isActive) ~= "boolean"
     then
         return nil
     end
 
-    -- duration <= 1.5 is just the GCD
-    if duration <= 1.5 then
-        return 0
+    if not isActive then return 0 end
+    if inCombat then return nil end
+
+    local duration
+    if petSpellSlot then
+        duration = C_SpellBook.GetSpellBookItemCooldownDuration(petSpellSlot, Enum.SpellBookSpellBank.Pet, true)
+    else
+        duration = C_Spell.GetSpellCooldownDuration(LR.heroismSpellID, true)
     end
 
-    local remaining = (startTime + duration) - GetTime()
+    if issecretvalue(duration) or not duration then return nil end
+
+    -- Native duration objects account for cooldown rate changes and the GCD.
+    local remaining = duration:GetRemainingDuration()
+    if issecretvalue(remaining) or type(remaining) ~= "number" then return nil end
 
     return math.max(remaining, 0)
+end
+
+local function IsHeroismUsable()
+    local isUsable
+    if petSpellSlot then
+        isUsable = C_SpellBook.IsSpellBookItemUsable(petSpellSlot, Enum.SpellBookSpellBank.Pet)
+    else
+        isUsable = C_Spell.IsSpellUsable(LR.heroismSpellID)
+    end
+
+    return not issecretvalue(isUsable) and isUsable == true
+end
+
+local function GetDrumsCooldownRemaining()
+    local shortestRemaining
+    for _, itemID in ipairs(ownedDrums) do
+        if C_Item.IsItemDataCachedByID(itemID) and C_Item.IsUsableItem(itemID)
+            and C_Item.GetItemCount(itemID) > 0
+        then
+            local startTime, duration, isEnabled = C_Item.GetItemCooldown(itemID)
+            if not issecretvalue(startTime) and not issecretvalue(duration)
+                and not issecretvalue(isEnabled) and isEnabled == true
+                and type(startTime) == "number" and type(duration) == "number"
+            then
+                local remaining = math.max(startTime + duration - GetTime(), 0)
+                if not shortestRemaining or remaining < shortestRemaining then
+                    shortestRemaining = remaining
+                end
+            end
+        end
+    end
+
+    if inCombat and shortestRemaining and shortestRemaining > 0 then return nil end
+
+    return shortestRemaining
 end
 
 -------------------------------------------------------------------------------
@@ -180,36 +277,12 @@ end
 --- Visibility
 -------------------------------------------------------------------------------
 
-local function IsHeroismReady(spellID)
-    local isOnCooldown = IsHeroismOnCooldown(spellID)
-    if isOnCooldown == nil or isOnCooldown then
-        return false
-    end
-
-    if HasSatedDebuff() then
-        return false
-    end
-
-    return true
-end
-
 function LR:ShouldShow()
-    if not LR.heroismSpellID then
+    if not IsInGroupInstance() or UnitIsDeadOrGhost("player") then
         return false, nil
     end
 
-    -- In combat, cooldown fields are tainted (secret values) and cannot
-    -- be compared.  Only check ready state, skip the countdown window.
-    if inCombat then
-        if IsHeroismReady(LR.heroismSpellID) then
-            return true, 0
-        end
-
-        return false, nil
-    end
-
-    local cdRemaining = GetHeroismCooldownRemaining(LR.heroismSpellID)
-    if not cdRemaining then
+    if not LR.heroismSpellID and #ownedDrums == 0 then
         return false, nil
     end
 
@@ -218,65 +291,69 @@ function LR:ShouldShow()
         return false, nil
     end
 
-    local remaining = math.max(cdRemaining, satedRemaining)
+    local cdRemaining, label
+    if LR.heroismSpellID then
+        cdRemaining = GetHeroismCooldownRemaining()
+        label = "Lust"
+    else
+        cdRemaining = GetDrumsCooldownRemaining()
+        label = "Drums"
+    end
 
-    local isReady = remaining == 0
-    local isSoon = remaining > 0 and remaining <= COUNTDOWN_THRESHOLD
-
-    if not isReady and not isSoon then
+    if cdRemaining == nil then
         return false, nil
     end
 
-    if IsInGroupInstance() then
-        return true, remaining
+    local remaining = math.max(cdRemaining, satedRemaining)
+    if remaining == 0 and LR.heroismSpellID and not IsHeroismUsable() then
+        return false, nil
     end
 
-    return false, nil
+    return remaining <= COUNTDOWN_THRESHOLD, remaining, label
 end
 
-function LR:UpdateText(remaining)
+function LR:UpdateText(remaining, label)
+    label = label or "Lust"
     if remaining == 0 then
-        LR.frame.text:SetText("Lust Ready")
+        LR.frame.text:SetText(label .. " Ready")
     else
-        LR.frame.text:SetText("Lust in " .. math.ceil(remaining))
+        LR.frame.text:SetText(label .. " in " .. math.ceil(remaining))
     end
 end
 
-local UPDATE_INTERVAL = 0.5
-local timeSinceLastUpdate = 0
+local function OnRefreshTimer()
+    refreshTimer = nil
+    LR:UpdateVisibility()
+end
 
 function LR:UpdateVisibility()
-    if testing then
+    if refreshTimer then
+        refreshTimer:Cancel()
+        refreshTimer = nil
+    end
+
+    if testing or not LustReadyDB.locked then
+        LR:UpdateText(0)
         LR.frame:Show()
         LR:UpdateMover()
 
         return
     end
 
-    if not LustReadyDB.locked then
-        LR.frame:Show()
-
-        return
-    end
-
-    local shouldShow, remaining = LR:ShouldShow()
+    local shouldShow, remaining, label = LR:ShouldShow()
 
     if shouldShow then
-        LR:UpdateText(remaining)
+        LR:UpdateText(remaining, label)
         LR.frame:Show()
-        LR.frame:SetScript("OnUpdate", LR.OnUpdate)
     else
         LR.frame:Hide()
-        LR.frame:SetScript("OnUpdate", nil)
     end
-end
 
-function LR.OnUpdate(self, elapsed)
-    timeSinceLastUpdate = timeSinceLastUpdate + elapsed
-    if timeSinceLastUpdate < UPDATE_INTERVAL then return end
-
-    timeSinceLastUpdate = 0
-    LR:UpdateVisibility()
+    if remaining and remaining > 0 then
+        -- Wake at the countdown boundary even while the display is hidden.
+        local delay = math.max(remaining - COUNTDOWN_THRESHOLD, UPDATE_INTERVAL)
+        refreshTimer = C_Timer.NewTimer(delay, OnRefreshTimer)
+    end
 end
 
 -------------------------------------------------------------------------------
@@ -333,6 +410,8 @@ LR.frame.text:SetText("Lust Ready")
 local function OnAddonLoaded(self, arg1)
     if arg1 ~= ADDON_NAME then return end
 
+    self:UnregisterEvent("ADDON_LOADED")
+
     if not LustReadyDB then
         LR:Print("LustReadyDB not available, creating.")
         LustReadyDB = { locked = false }
@@ -344,18 +423,34 @@ local function OnAddonLoaded(self, arg1)
         LR.frame:SetPoint(pos.point, UIParent, pos.relPoint, pos.x, pos.y)
     end
 
-    LR.heroismSpellID = FindPlayerHeroismSpell()
+    self:RegisterUnitEvent("UNIT_AURA", "player")
+    self:RegisterUnitEvent("UNIT_PET", "player")
+    self:RegisterUnitEvent("UNIT_HEALTH", "pet")
+    self:RegisterUnitEvent("UNIT_FLAGS", "pet")
+    self:RegisterEvent("SPELL_UPDATE_COOLDOWN")
+    self:RegisterEvent("SPELL_UPDATE_USABLE")
+    self:RegisterEvent("SPELLS_CHANGED")
+    self:RegisterEvent("PLAYER_SPECIALIZATION_CHANGED")
+    self:RegisterEvent("PET_BAR_UPDATE")
+    self:RegisterEvent("PET_UI_UPDATE")
+    self:RegisterEvent("PET_BAR_UPDATE_COOLDOWN")
+    self:RegisterEvent("PET_BAR_UPDATE_USABLE")
+    self:RegisterEvent("BAG_UPDATE_DELAYED")
+    self:RegisterEvent("BAG_UPDATE_COOLDOWN")
+    self:RegisterEvent("GET_ITEM_INFO_RECEIVED")
+    self:RegisterEvent("PLAYER_LEVEL_UP")
+    self:RegisterEvent("PLAYER_ENTERING_WORLD")
+    self:RegisterEvent("ZONE_CHANGED_NEW_AREA")
+    self:RegisterEvent("PLAYER_DEAD")
+    self:RegisterEvent("PLAYER_ALIVE")
+    self:RegisterEvent("PLAYER_UNGHOST")
+    self:RegisterEvent("PLAYER_REGEN_DISABLED")
+    self:RegisterEvent("PLAYER_REGEN_ENABLED")
+
+    inCombat = InCombatLockdown()
+    LR:RefreshSources()
     LR:UpdateMover()
     LR:UpdateVisibility()
-
-    LR.frame:UnregisterEvent("ADDON_LOADED")
-    LR.frame:RegisterEvent("UNIT_AURA")
-    LR.frame:RegisterEvent("SPELL_UPDATE_COOLDOWN")
-    LR.frame:RegisterEvent("SPELLS_CHANGED")
-    LR.frame:RegisterEvent("PLAYER_ENTERING_WORLD")
-    LR.frame:RegisterEvent("ZONE_CHANGED_NEW_AREA")
-    LR.frame:RegisterEvent("PLAYER_REGEN_DISABLED")
-    LR.frame:RegisterEvent("PLAYER_REGEN_ENABLED")
 
     LR:Print("Loaded. Use " .. SLASH_LUSTREADY1 .. " for commands.")
 end
@@ -366,19 +461,44 @@ local function OnUnitAura(self, unit)
     LR:UpdateVisibility()
 end
 
-local function OnSpellUpdateCooldown()
+local function OnReadinessChanged()
     LR:UpdateVisibility()
 end
 
-local function OnSpellsChanged()
-    LR.heroismSpellID = FindPlayerHeroismSpell()
-    LR:VPrint("Spells changed — heroism spell: " .. tostring(LR.heroismSpellID))
+local function OnSourcesChanged()
+    LR:RefreshSources()
+    LR:VPrint("Source changed — spell: " .. tostring(LR.heroismSpellID)
+        .. ", pet slot: " .. tostring(petSpellSlot) .. ", carried drums: " .. #ownedDrums)
     LR:UpdateVisibility()
+end
+
+local function OnPlayerSourceChanged(self, unit)
+    if issecretvalue(unit) or unit ~= "player" then return end
+
+    OnSourcesChanged()
+end
+
+local function OnPetHealthChanged(self, unit)
+    if issecretvalue(unit) or unit ~= "pet" then return end
+
+    -- Health changes are frequent; only rediscover on death/resurrection.
+    if IsPetAvailable() ~= petAvailable then
+        OnSourcesChanged()
+    end
+end
+
+local function OnItemInfoReceived(self, itemID, success)
+    if not pendingItemData[itemID] then return end
+
+    pendingItemData[itemID] = nil
+    if success then
+        OnSourcesChanged()
+    end
 end
 
 local function OnPlayerEnteringWorld()
-    LR.heroismSpellID = FindPlayerHeroismSpell()
     inCombat = InCombatLockdown()
+    LR:RefreshSources()
     LR:UpdateVisibility()
 end
 
@@ -393,14 +513,30 @@ local function OnCombatEnd()
 end
 
 local EVENT_HANDLERS = {
-    ADDON_LOADED           = OnAddonLoaded,
-    UNIT_AURA              = OnUnitAura,
-    SPELL_UPDATE_COOLDOWN  = OnSpellUpdateCooldown,
-    SPELLS_CHANGED         = OnSpellsChanged,
-    PLAYER_ENTERING_WORLD  = OnPlayerEnteringWorld,
-    ZONE_CHANGED_NEW_AREA  = OnPlayerEnteringWorld,
-    PLAYER_REGEN_DISABLED  = OnCombatStart,
-    PLAYER_REGEN_ENABLED   = OnCombatEnd,
+    ADDON_LOADED                  = OnAddonLoaded,
+    UNIT_AURA                     = OnUnitAura,
+    UNIT_PET                      = OnPlayerSourceChanged,
+    UNIT_HEALTH                   = OnPetHealthChanged,
+    UNIT_FLAGS                    = OnPetHealthChanged,
+    SPELL_UPDATE_COOLDOWN         = OnReadinessChanged,
+    SPELL_UPDATE_USABLE           = OnReadinessChanged,
+    SPELLS_CHANGED                = OnSourcesChanged,
+    PLAYER_SPECIALIZATION_CHANGED = OnPlayerSourceChanged,
+    PET_BAR_UPDATE                = OnSourcesChanged,
+    PET_UI_UPDATE                 = OnSourcesChanged,
+    PET_BAR_UPDATE_COOLDOWN       = OnReadinessChanged,
+    PET_BAR_UPDATE_USABLE         = OnReadinessChanged,
+    BAG_UPDATE_DELAYED            = OnSourcesChanged,
+    BAG_UPDATE_COOLDOWN           = OnReadinessChanged,
+    GET_ITEM_INFO_RECEIVED        = OnItemInfoReceived,
+    PLAYER_LEVEL_UP               = OnSourcesChanged,
+    PLAYER_ENTERING_WORLD         = OnPlayerEnteringWorld,
+    ZONE_CHANGED_NEW_AREA         = OnPlayerEnteringWorld,
+    PLAYER_DEAD                   = OnReadinessChanged,
+    PLAYER_ALIVE                  = OnReadinessChanged,
+    PLAYER_UNGHOST                = OnReadinessChanged,
+    PLAYER_REGEN_DISABLED         = OnCombatStart,
+    PLAYER_REGEN_ENABLED          = OnCombatEnd,
 }
 
 LR.frame:RegisterEvent("ADDON_LOADED")
